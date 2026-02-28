@@ -1,0 +1,476 @@
+from __future__ import annotations
+
+import enum
+import time
+from dataclasses import dataclass, field
+from typing import List, Optional, Sequence
+
+import numpy as np
+
+from common_utils.robot_constants import (
+    PANDA_LOWER_LIMITS,
+    PANDA_UPPER_LIMITS,
+    PANDA_JOINT_RANGES,
+    PANDA_REST_POSES,
+)
+from common_utils.apf import attractive_force, repulsive_force, total_field_force
+
+
+class GraspState(enum.Enum):
+    IDLE = "idle"
+    APPROACH = "approach"
+    DESCEND = "descend"
+    GRASP = "grasp"
+    LIFT = "lift"
+    DONE = "done"
+    FAILED = "failed"
+
+
+class PlaceState(enum.Enum):
+    TRANSIT = "transit"
+    LOWER = "lower"
+    RELEASE = "release"
+    RETRACT = "retract"
+    DONE = "done"
+    FAILED = "failed"
+
+
+@dataclass
+class GraspResult:
+    success: bool
+    final_ee_position: np.ndarray
+    final_object_position: Optional[np.ndarray]
+    states_visited: List[GraspState]
+
+
+@dataclass
+class PlaceResult:
+    success: bool
+    final_ee_position: np.ndarray
+    final_object_position: Optional[np.ndarray]
+    states_visited: List[PlaceState]
+
+
+@dataclass
+class PickAndPlaceResult:
+    pick_success: bool
+    place_success: bool
+    pick_result: Optional[GraspResult]
+    place_result: Optional[PlaceResult]
+    object_name: Optional[str]
+    slot_index: Optional[int] = None
+
+
+class RobotController:
+
+    PANDA_LOWER_LIMITS = PANDA_LOWER_LIMITS
+    PANDA_UPPER_LIMITS = PANDA_UPPER_LIMITS
+    PANDA_JOINT_RANGES = PANDA_JOINT_RANGES
+    PANDA_REST_POSES = PANDA_REST_POSES
+
+    GRIPPER_OPEN = 0.08
+    GRIPPER_PREGRASP = 0.05   # narrower opening for descent – fits 0.04 m cube
+    GRIPPER_CLOSED = 0.0
+    SAFE_HEIGHT = 0.25  # absolute Z for collision-free lateral transit
+
+    def __init__(
+        self,
+        sim,
+        robot,
+        robot_body_id: int,
+        *,
+        approach_height: float = 0.15,
+        lift_height: float = 0.20,
+        descend_offset: float = -0.02,
+        move_tolerance: float = 0.005,
+        move_max_steps: int = 300,
+        grasp_steps: int = 60,
+        sim_delay: float = 0.0,
+    ) -> None:
+        self._sim = sim
+        self._robot = robot
+        self._body_id = robot_body_id
+        self._p = sim.physics_client
+        self.approach_height = approach_height
+        self.lift_height = lift_height
+        self.descend_offset = descend_offset
+        self.move_tolerance = move_tolerance
+        self.move_max_steps = move_max_steps
+        self.grasp_steps = grasp_steps
+        self.sim_delay = sim_delay
+
+    def _step(self) -> None:
+        self._sim.step()
+        if self.sim_delay > 0:
+            time.sleep(self.sim_delay)
+
+    # ------------------------------------------------------------------
+    # Artificial Potential Field helpers
+    # ------------------------------------------------------------------
+    # Tuning constants for the APF
+    APF_ETA = 0.005          # repulsive gain η
+    APF_XI = 1.0             # attractive gain ξ
+    APF_D_THRESH = 0.12      # influence radius of each obstacle (m)
+    APF_ALPHA = 0.30         # velocity scaling gain α
+    APF_DT = 1.0             # pseudo-timestep for position update
+    APF_PERTURB = 0.005      # random nudge when velocity is tiny
+    APF_VEL_MIN = 1e-4       # velocity floor that triggers perturbation
+
+    @staticmethod
+    def _attractive_force(
+        gripper_pos: np.ndarray,
+        goal_pos: np.ndarray,
+        xi: float,
+    ) -> np.ndarray:
+        return attractive_force(gripper_pos, goal_pos, xi)
+
+    @staticmethod
+    def _repulsive_force(
+        gripper_pos: np.ndarray,
+        obstacle_pos: np.ndarray,
+        eta: float,
+        d_thresh: float,
+    ) -> np.ndarray:
+        return repulsive_force(gripper_pos, obstacle_pos, eta, d_thresh)
+
+    def _total_field_force(
+        self,
+        gripper_pos: np.ndarray,
+        goal_pos: np.ndarray,
+        obstacle_positions: Sequence[np.ndarray],
+    ) -> np.ndarray:
+        return total_field_force(
+            gripper_pos, goal_pos, list(obstacle_positions),
+            xi=self.APF_XI, eta=self.APF_ETA, d_thresh=self.APF_D_THRESH,
+        )
+
+    def move_to_field(
+        self,
+        target_position: np.ndarray,
+        gripper_width: float,
+        obstacle_positions: Sequence[np.ndarray],
+        tolerance: float = 0.005,
+        max_steps: int = 480,
+        orientation: np.ndarray = np.array([1.0, 0.0, 0.0, 0.0]),
+    ) -> bool:
+        """Move toward *target_position* while steering around obstacles
+        via an Artificial Potential Field.
+
+        Each step:
+            1. Compute F_total = F_att + F_rep
+            2. V_desired = α · F_total
+            3. P_new = P_current + V_desired · Δt  (clamped to reasonable step)
+            4. IK → joint angles → control
+        If F_total is nearly zero (local minimum) add a random perturbation.
+        """
+        for _ in range(max_steps):
+            ee_pos = self._robot.get_ee_position()
+            err = np.linalg.norm(ee_pos - target_position)
+            if err < tolerance:
+                return True
+
+            f_total = self._total_field_force(ee_pos, target_position, obstacle_positions)
+            v_desired = self.APF_ALPHA * f_total
+
+            # Local-minimum escape: random perturbation
+            if np.linalg.norm(v_desired) < self.APF_VEL_MIN:
+                v_desired += np.random.uniform(-self.APF_PERTURB, self.APF_PERTURB, size=3)
+
+            # Clamp step size to avoid overshoot
+            step = v_desired * self.APF_DT
+            step_norm = np.linalg.norm(step)
+            max_step = 0.02  # 2 cm per tick
+            if step_norm > max_step:
+                step = step * (max_step / step_norm)
+
+            p_new = ee_pos + step
+            # Don't push below table surface
+            p_new[2] = max(p_new[2], 0.0)
+
+            arm_angles = self.solve_ik(p_new, orientation)
+            finger_val = gripper_width / 2.0
+            target_angles = np.concatenate([arm_angles, [finger_val, finger_val]])
+            self._sim.control_joints(
+                body=self._robot.body_name,
+                joints=self._robot.joint_indices,
+                target_angles=target_angles,
+                forces=self._robot.joint_forces,
+            )
+            self._step()
+
+        return False
+
+    def solve_ik(
+        self,
+        target_position: np.ndarray,
+        target_orientation: np.ndarray = np.array([1.0, 0.0, 0.0, 0.0]),
+    ) -> np.ndarray:
+        joint_angles = self._p.calculateInverseKinematics(
+            bodyIndex=self._body_id,
+            endEffectorLinkIndex=self._robot.ee_link,
+            targetPosition=target_position.tolist(),
+            targetOrientation=target_orientation.tolist(),
+        )
+        return np.array(joint_angles[:7])
+
+    def move_to(
+        self,
+        target_position: np.ndarray,
+        gripper_width: float,
+        tolerance: float = 0.005,
+        max_steps: int = 480,
+        orientation: np.ndarray = np.array([1.0, 0.0, 0.0, 0.0]),
+    ) -> bool:
+        for _ in range(max_steps):
+            arm_angles = self.solve_ik(target_position, orientation)
+            finger_val = gripper_width / 2.0
+            target_angles = np.concatenate([arm_angles, [finger_val, finger_val]])
+            self._sim.control_joints(
+                body=self._robot.body_name,
+                joints=self._robot.joint_indices,
+                target_angles=target_angles,
+                forces=self._robot.joint_forces,
+            )
+            self._step()
+            ee_pos = self._robot.get_ee_position()
+            if np.linalg.norm(ee_pos - target_position) < tolerance:
+                return True
+        return False
+
+    def set_gripper(self, width: float, steps: int = 120) -> None:
+        finger_val = width / 2.0
+        current_arm = np.array([self._robot.get_joint_angle(j) for j in range(7)])
+        target_angles = np.concatenate([current_arm, [finger_val, finger_val]])
+        for _ in range(steps):
+            self._sim.control_joints(
+                body=self._robot.body_name,
+                joints=self._robot.joint_indices,
+                target_angles=target_angles,
+                forces=self._robot.joint_forces,
+            )
+            self._step()
+
+    def get_ee_position(self) -> np.ndarray:
+        return self._robot.get_ee_position()
+
+    # Retract pose: arm tucked to the side so the overhead camera has
+    # a clear view of the entire workspace.
+    _SENSING_POSITION = np.array([0.0, -0.30, 0.35])
+
+    def retract_for_sensing(self) -> bool:
+        """Move the arm out of the camera's field of view."""
+        return self.move_to(
+            self._SENSING_POSITION,
+            gripper_width=self.GRIPPER_CLOSED,
+            tolerance=0.01,
+            max_steps=self.move_max_steps,
+        )
+
+    def _move(
+        self,
+        target: np.ndarray,
+        gripper_width: float,
+        obstacles: Sequence[np.ndarray],
+    ) -> bool:
+        """Convenience: use APF when obstacles are supplied, else straight-line."""
+        if len(obstacles) > 0:
+            return self.move_to_field(
+                target,
+                gripper_width=gripper_width,
+                obstacle_positions=obstacles,
+                tolerance=self.move_tolerance,
+                max_steps=self.move_max_steps,
+            )
+        return self.move_to(
+            target,
+            gripper_width=gripper_width,
+            tolerance=self.move_tolerance,
+            max_steps=self.move_max_steps,
+        )
+
+    def grasp_point_world(
+        self,
+        target_xyz: np.ndarray,
+        object_name: Optional[str] = None,
+        obstacle_positions: Optional[Sequence[np.ndarray]] = None,
+    ) -> GraspResult:
+        visited: List[GraspState] = []
+        state = GraspState.APPROACH
+        obs = list(obstacle_positions) if obstacle_positions else []
+
+        approach_pos = target_xyz.copy()
+        approach_pos[2] = max(target_xyz[2] + self.approach_height, self.SAFE_HEIGHT)
+
+        descend_pos = target_xyz.copy()
+        descend_pos[2] += self.descend_offset
+
+        lift_pos = descend_pos.copy()
+        lift_pos[2] = max(descend_pos[2] + self.lift_height, self.SAFE_HEIGHT)
+
+        while state not in (GraspState.DONE, GraspState.FAILED):
+            visited.append(state)
+
+            if state == GraspState.APPROACH:
+                self.set_gripper(self.GRIPPER_OPEN, steps=self.grasp_steps // 2)
+                # Rise to safe height first
+                safe_pos = self._robot.get_ee_position().copy()
+                safe_pos[2] = self.SAFE_HEIGHT
+                self._move(safe_pos, self.GRIPPER_OPEN, obs)
+                # Lateral move to above target – APF steers around cubes
+                ok = self._move(approach_pos, self.GRIPPER_OPEN, obs)
+                if ok:
+                    # Narrow to pre-grasp width before descending so the
+                    # fingers don't clip neighbouring cubes.
+                    self.set_gripper(self.GRIPPER_PREGRASP, steps=self.grasp_steps // 4)
+                state = GraspState.DESCEND if ok else GraspState.FAILED
+
+            elif state == GraspState.DESCEND:
+                # Committed vertical drop with narrow pre-grasp width –
+                # bypass APF so repulsion cannot deflect sideways.
+                ok = self.move_to(
+                    descend_pos,
+                    gripper_width=self.GRIPPER_PREGRASP,
+                    tolerance=self.move_tolerance,
+                    max_steps=self.move_max_steps,
+                )
+                state = GraspState.GRASP if ok else GraspState.FAILED
+
+            elif state == GraspState.GRASP:
+                self.set_gripper(self.GRIPPER_CLOSED, steps=self.grasp_steps)
+                state = GraspState.LIFT
+
+            elif state == GraspState.LIFT:
+                # Lift up – APF ensures we don't sideswipe neighbours
+                ok = self._move(lift_pos, self.GRIPPER_CLOSED, obs)
+                state = GraspState.DONE if ok else GraspState.FAILED
+
+        visited.append(state)
+
+        final_ee = self._robot.get_ee_position()
+        final_obj = None
+        if object_name is not None:
+            try:
+                final_obj = self._sim.get_base_position(object_name)
+            except Exception:
+                pass
+
+        success = (state == GraspState.DONE)
+        if success and final_obj is not None:
+            success = final_obj[2] > (target_xyz[2] + self.lift_height * 0.3)
+
+        return GraspResult(
+            success=success,
+            final_ee_position=final_ee,
+            final_object_position=final_obj,
+            states_visited=visited,
+        )
+
+    def place_at_world(
+        self,
+        target_xyz: np.ndarray,
+        object_name: Optional[str] = None,
+        *,
+        place_height: float = 0.0,
+        retract_height: float = 0.12,
+        obstacle_positions: Optional[Sequence[np.ndarray]] = None,
+    ) -> PlaceResult:
+        visited: List[PlaceState] = []
+        state = PlaceState.TRANSIT
+        obs = list(obstacle_positions) if obstacle_positions else []
+
+        transit_pos = target_xyz.copy()
+        transit_pos[2] = max(target_xyz[2] + self.approach_height, self.SAFE_HEIGHT)
+
+        lower_pos = target_xyz.copy()
+        lower_pos[2] += place_height
+
+        retract_pos = lower_pos.copy()
+        retract_pos[2] = max(lower_pos[2] + retract_height, self.SAFE_HEIGHT)
+
+        while state not in (PlaceState.DONE, PlaceState.FAILED):
+            visited.append(state)
+
+            if state == PlaceState.TRANSIT:
+                ok = self._move(transit_pos, self.GRIPPER_CLOSED, obs)
+                state = PlaceState.LOWER if ok else PlaceState.FAILED
+
+            elif state == PlaceState.LOWER:
+                # Committed vertical drop – bypass APF so the held cube
+                # lands precisely on its target slot without lateral drift.
+                ok = self.move_to(
+                    lower_pos,
+                    gripper_width=self.GRIPPER_CLOSED,
+                    tolerance=self.move_tolerance,
+                    max_steps=self.move_max_steps,
+                )
+                state = PlaceState.RELEASE if ok else PlaceState.FAILED
+
+            elif state == PlaceState.RELEASE:
+                self.set_gripper(self.GRIPPER_OPEN, steps=self.grasp_steps)
+                # Let the object settle on the surface before retracting
+                for _ in range(20):
+                    self._step()
+                state = PlaceState.RETRACT
+
+            elif state == PlaceState.RETRACT:
+                ok = self._move(retract_pos, self.GRIPPER_OPEN, obs)
+                state = PlaceState.DONE if ok else PlaceState.FAILED
+
+        visited.append(state)
+
+        final_ee = self._robot.get_ee_position()
+        final_obj = None
+        if object_name is not None:
+            try:
+                final_obj = self._sim.get_base_position(object_name)
+            except Exception:
+                pass
+
+        return PlaceResult(
+            success=(state == PlaceState.DONE),
+            final_ee_position=final_ee,
+            final_object_position=final_obj,
+            states_visited=visited,
+        )
+
+    def pick_and_place(
+        self,
+        pick_xyz: np.ndarray,
+        place_xyz: np.ndarray,
+        object_name: Optional[str] = None,
+        *,
+        place_height: float = 0.0,
+        obstacle_positions: Optional[Sequence[np.ndarray]] = None,
+    ) -> PickAndPlaceResult:
+        obs = list(obstacle_positions) if obstacle_positions else []
+        grasp_res = self.grasp_point_world(
+            pick_xyz, object_name=object_name, obstacle_positions=obs,
+        )
+        if not grasp_res.success:
+            return PickAndPlaceResult(
+                pick_success=False,
+                place_success=False,
+                pick_result=grasp_res,
+                place_result=None,
+                object_name=object_name,
+            )
+
+        # Move to safe height before lateral transit
+        safe_pos = self._robot.get_ee_position().copy()
+        safe_pos[2] = self.SAFE_HEIGHT
+        self._move(safe_pos, self.GRIPPER_CLOSED, obs)
+
+        place_res = self.place_at_world(
+            place_xyz,
+            object_name=object_name,
+            place_height=place_height,
+            obstacle_positions=obs,
+        )
+
+        return PickAndPlaceResult(
+            pick_success=True,
+            place_success=place_res.success,
+            pick_result=grasp_res,
+            place_result=place_res,
+            object_name=object_name,
+        )
