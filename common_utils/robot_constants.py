@@ -1,3 +1,10 @@
+"""Franka Emika Panda kinematic constants.
+
+These arrays define the joint limits, rest configuration, joint
+forces, and link indices used throughout the package.  They are
+hard physical properties of the robot and do not belong in the
+YAML configuration file.
+"""
 from __future__ import annotations
 
 import numpy as np

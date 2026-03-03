@@ -1,0 +1,107 @@
+# ── panda_control default configuration ──────────────────────
+#
+# All tunable parameters in one place.  Modules read these values
+# via ``from panda_control.config import get as cfg``.
+
+# ── Camera ───────────────────────────────────────────────────
+camera:
+  width: 640
+  height: 480
+  fov: 60.0
+  near_plane: 0.02
+  far_plane: 5.0
+
+  overhead:
+    distance: 1.0
+    yaw: 0.0
+    pitch: -89.9
+    roll: 0.0
+
+  wrist:
+    link_index: 11
+    offset_distance: 0.05
+
+# ── Scene (cube spawning) ───────────────────────────────────
+scene:
+  table:
+    x_offset: -0.3
+    length: 1.1
+    width: 0.7
+    height: 0.4
+
+  cube:
+    half_extent: 0.02
+    mass: 0.1
+    z_offset: 0.0
+    lateral_friction: 1.0
+    color_min: 0.15
+    color_max: 1.0
+
+  spawn:
+    xy_range_x: 0.25
+    xy_range_y: 0.15
+    separation_factor: 3       # min_sep = half_extent * factor
+    max_attempts: 200
+
+# ── Perception ───────────────────────────────────────────────
+perception:
+  min_pixel_count: 10
+  static_body_names:
+    - panda
+    - plane
+    - table
+    - target
+    - object
+
+# ── Robot controller ─────────────────────────────────────────
+robot:
+  gripper:
+    open_width: 0.08
+    pregrasp_width: 0.05
+    closed_width: 0.0
+    grasp_steps: 60
+    set_gripper_steps: 120
+
+  motion:
+    approach_height: 0.15
+    lift_height: 0.20
+    descend_offset: -0.02
+    safe_height: 0.25
+    move_tolerance: 0.005
+    move_max_steps: 300
+    retract_height: 0.12
+    max_step_size: 0.02
+
+  sensing_position: [0.0, -0.30, 0.35]
+
+  apf:
+    eta: 0.005
+    xi: 1.0
+    d_thresh: 0.12
+    alpha: 0.30
+    dt: 1.0
+    perturb: 0.005
+    vel_min: 0.0001
+
+# ── Task runner ──────────────────────────────────────────────
+task:
+  default_n_cubes: 5
+  sim_settle_steps: 10
+  hidden_position: [0.0, 0.0, -2.0]
+  hidden_orientation: [0.0, 0.0, 0.0, 1.0]
+
+  pick_and_place_one:
+    default_place_position: [0.0, 0.15, 0.0]
+
+  pick_and_place_all:
+    default_place_position: [0.0, 0.0, 0.0]
+    spacing: 0.12
+    max_reach: 0.20
+    settle_steps: 20
+
+  stack:
+    settle_steps: 60
+
+# ── Main CLI defaults ────────────────────────────────────────
+cli:
+  default_delay: 0.0333       # ~30 fps

@@ -1,3 +1,25 @@
+"""Low-level robot controller: IK solving, motion, grasping, and placement.
+
+:class:`RobotController` owns every physical interaction with the
+Franka Panda arm.  Higher-level orchestration (which cube to pick,
+where to place it) lives in :mod:`panda_control.task_runner`; this
+module is concerned only with executing motions and state machines.
+
+Key capabilities:
+
+* **Inverse kinematics** -- :meth:`solve_ik` wraps PyBullet's IK.
+* **Point-to-point motion** -- :meth:`move_to` (straight-line) and
+  :meth:`move_to_field` (Artificial Potential Field with obstacle
+  avoidance).
+* **Grasp state machine** -- :meth:`grasp_point_world` drives the
+  arm through APPROACH -> DESCEND -> GRASP -> LIFT.
+* **Place state machine** -- :meth:`place_at_world` lowers the held
+  object and releases it.
+* **Combined pick-and-place** -- :meth:`pick_and_place`.
+
+All tuneable constants (gripper widths, heights, APF gains, step
+limits) are read from ``config/default.yaml`` at construction time.
+"""
 from __future__ import annotations
 
 import enum
@@ -7,16 +29,21 @@ from typing import List, Optional, Sequence
 
 import numpy as np
 
-from common_utils.robot_constants import (
+from panda_control.config import get as cfg
+from panda_control.common_utils.robot_constants import (
     PANDA_LOWER_LIMITS,
     PANDA_UPPER_LIMITS,
     PANDA_JOINT_RANGES,
     PANDA_REST_POSES,
 )
-from common_utils.apf import attractive_force, repulsive_force, total_field_force
+from panda_control.common_utils.apf import attractive_force, repulsive_force, total_field_force
 
+
+# ── state enumerations ──────────────────────────────────────
 
 class GraspState(enum.Enum):
+    """Finite-state labels for the grasp state machine."""
+
     IDLE = "idle"
     APPROACH = "approach"
     DESCEND = "descend"
@@ -27,6 +54,8 @@ class GraspState(enum.Enum):
 
 
 class PlaceState(enum.Enum):
+    """Finite-state labels for the place state machine."""
+
     TRANSIT = "transit"
     LOWER = "lower"
     RELEASE = "release"
@@ -35,8 +64,12 @@ class PlaceState(enum.Enum):
     FAILED = "failed"
 
 
+# ── result dataclasses ──────────────────────────────────────
+
 @dataclass
 class GraspResult:
+    """Outcome of a single grasp attempt."""
+
     success: bool
     final_ee_position: np.ndarray
     final_object_position: Optional[np.ndarray]
@@ -45,6 +78,8 @@ class GraspResult:
 
 @dataclass
 class PlaceResult:
+    """Outcome of a single placement attempt."""
+
     success: bool
     final_ee_position: np.ndarray
     final_object_position: Optional[np.ndarray]
@@ -53,6 +88,8 @@ class PlaceResult:
 
 @dataclass
 class PickAndPlaceResult:
+    """Combined outcome of a pick followed by a place."""
+
     pick_success: bool
     place_success: bool
     pick_result: Optional[GraspResult]
@@ -61,17 +98,44 @@ class PickAndPlaceResult:
     slot_index: Optional[int] = None
 
 
-class RobotController:
+# ── controller ──────────────────────────────────────────────
 
+class RobotController:
+    """Joint-level and task-space controller for the Franka Panda.
+
+    Parameters
+    ----------
+    sim : panda_gym.pybullet.PyBullet
+        Simulation wrapper.
+    robot : panda_gym.envs.robots.panda.Panda
+        Robot instance.
+    robot_body_id : int
+        PyBullet body index of the robot.
+    approach_height, lift_height, descend_offset : float
+        Vertical offsets used by the grasp state machine.
+    move_tolerance : float
+        Cartesian tolerance (metres) for ``move_to`` convergence.
+    move_max_steps : int
+        Maximum simulation steps per motion primitive.
+    grasp_steps : int
+        Number of steps to hold the gripper closed.
+    sim_delay : float
+        Optional per-step sleep for visual slow-motion.
+    """
+
+    # Expose joint-limit arrays as class-level attributes for tests
     PANDA_LOWER_LIMITS = PANDA_LOWER_LIMITS
     PANDA_UPPER_LIMITS = PANDA_UPPER_LIMITS
     PANDA_JOINT_RANGES = PANDA_JOINT_RANGES
     PANDA_REST_POSES = PANDA_REST_POSES
 
-    GRIPPER_OPEN = 0.08
-    GRIPPER_PREGRASP = 0.05   # narrower opening for descent – fits 0.04 m cube
-    GRIPPER_CLOSED = 0.0
-    SAFE_HEIGHT = 0.25  # absolute Z for collision-free lateral transit
+    # Gripper width constants (metres)
+    GRIPPER_OPEN = cfg("robot", "gripper", "open_width")
+    GRIPPER_PREGRASP = cfg("robot", "gripper", "pregrasp_width")
+    GRIPPER_CLOSED = cfg("robot", "gripper", "closed_width")
+
+    # Altitude at which lateral motion is collision-free
+    SAFE_HEIGHT = cfg("robot", "motion", "safe_height")
 
     def __init__(
         self,
@@ -79,24 +143,25 @@ class RobotController:
         robot,
         robot_body_id: int,
         *,
-        approach_height: float = 0.15,
-        lift_height: float = 0.20,
-        descend_offset: float = -0.02,
-        move_tolerance: float = 0.005,
-        move_max_steps: int = 300,
-        grasp_steps: int = 60,
+        approach_height: float = None,
+        lift_height: float = None,
+        descend_offset: float = None,
+        move_tolerance: float = None,
+        move_max_steps: int = None,
+        grasp_steps: int = None,
         sim_delay: float = 0.0,
     ) -> None:
         self._sim = sim
         self._robot = robot
         self._body_id = robot_body_id
         self._p = sim.physics_client
-        self.approach_height = approach_height
-        self.lift_height = lift_height
-        self.descend_offset = descend_offset
-        self.move_tolerance = move_tolerance
-        self.move_max_steps = move_max_steps
-        self.grasp_steps = grasp_steps
+
+        self.approach_height = approach_height if approach_height is not None else cfg("robot", "motion", "approach_height")
+        self.lift_height = lift_height if lift_height is not None else cfg("robot", "motion", "lift_height")
+        self.descend_offset = descend_offset if descend_offset is not None else cfg("robot", "motion", "descend_offset")
+        self.move_tolerance = move_tolerance if move_tolerance is not None else cfg("robot", "motion", "move_tolerance")
+        self.move_max_steps = move_max_steps if move_max_steps is not None else cfg("robot", "motion", "move_max_steps")
+        self.grasp_steps = grasp_steps if grasp_steps is not None else cfg("robot", "gripper", "grasp_steps")
         self.sim_delay = sim_delay
 
     def _step(self) -> None:
@@ -104,17 +169,23 @@ class RobotController:
         if self.sim_delay > 0:
             time.sleep(self.sim_delay)
 
-    # ------------------------------------------------------------------
-    # Artificial Potential Field helpers
-    # ------------------------------------------------------------------
-    # Tuning constants for the APF
-    APF_ETA = 0.005          # repulsive gain η
-    APF_XI = 1.0             # attractive gain ξ
-    APF_D_THRESH = 0.12      # influence radius of each obstacle (m)
-    APF_ALPHA = 0.30         # velocity scaling gain α
-    APF_DT = 1.0             # pseudo-timestep for position update
-    APF_PERTURB = 0.005      # random nudge when velocity is tiny
-    APF_VEL_MIN = 1e-4       # velocity floor that triggers perturbation
+    # ── Artificial Potential Field tuning constants ────────────────
+    #
+    # All values are read from config/default.yaml -> robot.apf.
+    #   eta       -- repulsive gain
+    #   xi        -- attractive gain
+    #   d_thresh  -- influence radius of each obstacle (m)
+    #   alpha     -- velocity scaling gain
+    #   dt        -- pseudo-timestep for position update
+    #   perturb   -- random nudge magnitude for local-minimum escape
+    #   vel_min   -- velocity floor that triggers the perturbation
+    APF_ETA = cfg("robot", "apf", "eta")
+    APF_XI = cfg("robot", "apf", "xi")
+    APF_D_THRESH = cfg("robot", "apf", "d_thresh")
+    APF_ALPHA = cfg("robot", "apf", "alpha")
+    APF_DT = cfg("robot", "apf", "dt")
+    APF_PERTURB = cfg("robot", "apf", "perturb")
+    APF_VEL_MIN = cfg("robot", "apf", "vel_min")
 
     @staticmethod
     def _attractive_force(
@@ -122,6 +193,7 @@ class RobotController:
         goal_pos: np.ndarray,
         xi: float,
     ) -> np.ndarray:
+        """Compute the attractive potential-field force toward *goal_pos*."""
         return attractive_force(gripper_pos, goal_pos, xi)
 
     @staticmethod
@@ -131,6 +203,7 @@ class RobotController:
         eta: float,
         d_thresh: float,
     ) -> np.ndarray:
+        """Compute the repulsive potential-field force away from obstacles."""
         return repulsive_force(gripper_pos, obstacle_pos, eta, d_thresh)
 
     def _total_field_force(
@@ -179,7 +252,7 @@ class RobotController:
             # Clamp step size to avoid overshoot
             step = v_desired * self.APF_DT
             step_norm = np.linalg.norm(step)
-            max_step = 0.02  # 2 cm per tick
+            max_step = cfg("robot", "motion", "max_step_size")
             if step_norm > max_step:
                 step = step * (max_step / step_norm)
 
@@ -205,6 +278,7 @@ class RobotController:
         target_position: np.ndarray,
         target_orientation: np.ndarray = np.array([1.0, 0.0, 0.0, 0.0]),
     ) -> np.ndarray:
+        """Solve inverse kinematics for the given end-effector pose."""
         joint_angles = self._p.calculateInverseKinematics(
             bodyIndex=self._body_id,
             endEffectorLinkIndex=self._robot.ee_link,
@@ -221,6 +295,7 @@ class RobotController:
         max_steps: int = 480,
         orientation: np.ndarray = np.array([1.0, 0.0, 0.0, 0.0]),
     ) -> bool:
+        """Drive the end-effector to *target_position* via straight-line IK."""
         for _ in range(max_steps):
             arm_angles = self.solve_ik(target_position, orientation)
             finger_val = gripper_width / 2.0
@@ -237,7 +312,10 @@ class RobotController:
                 return True
         return False
 
-    def set_gripper(self, width: float, steps: int = 120) -> None:
+    def set_gripper(self, width: float, steps: int = None) -> None:
+        """Command the parallel-jaw gripper to *width* over *steps* ticks."""
+        if steps is None:
+            steps = cfg("robot", "gripper", "set_gripper_steps")
         finger_val = width / 2.0
         current_arm = np.array([self._robot.get_joint_angle(j) for j in range(7)])
         target_angles = np.concatenate([current_arm, [finger_val, finger_val]])
@@ -251,11 +329,12 @@ class RobotController:
             self._step()
 
     def get_ee_position(self) -> np.ndarray:
+        """Return the current 3-D world position of the end-effector."""
         return self._robot.get_ee_position()
 
     # Retract pose: arm tucked to the side so the overhead camera has
     # a clear view of the entire workspace.
-    _SENSING_POSITION = np.array([0.0, -0.30, 0.35])
+    _SENSING_POSITION = np.array(cfg("robot", "sensing_position"), dtype=np.float64)
 
     def retract_for_sensing(self) -> bool:
         """Move the arm out of the camera's field of view."""
@@ -294,6 +373,7 @@ class RobotController:
         object_name: Optional[str] = None,
         obstacle_positions: Optional[Sequence[np.ndarray]] = None,
     ) -> GraspResult:
+        """Execute the full APPROACH-DESCEND-GRASP-LIFT state machine."""
         visited: List[GraspState] = []
         state = GraspState.APPROACH
         obs = list(obstacle_positions) if obstacle_positions else []
@@ -371,9 +451,12 @@ class RobotController:
         object_name: Optional[str] = None,
         *,
         place_height: float = 0.0,
-        retract_height: float = 0.12,
+        retract_height: float = None,
         obstacle_positions: Optional[Sequence[np.ndarray]] = None,
     ) -> PlaceResult:
+        """Execute the TRANSIT-LOWER-RELEASE-RETRACT placement state machine."""
+        if retract_height is None:
+            retract_height = cfg("robot", "motion", "retract_height")
         visited: List[PlaceState] = []
         state = PlaceState.TRANSIT
         obs = list(obstacle_positions) if obstacle_positions else []
@@ -442,6 +525,7 @@ class RobotController:
         place_height: float = 0.0,
         obstacle_positions: Optional[Sequence[np.ndarray]] = None,
     ) -> PickAndPlaceResult:
+        """Grasp at *pick_xyz* then place at *place_xyz* in one call."""
         obs = list(obstacle_positions) if obstacle_positions else []
         grasp_res = self.grasp_point_world(
             pick_xyz, object_name=object_name, obstacle_positions=obs,

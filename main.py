@@ -1,21 +1,38 @@
+"""Command-line entry point for the Panda pick-and-place demo.
+
+Usage::
+
+    python -m panda_control.main                # pick and place one cube
+    python -m panda_control.main --all          # pick and place all cubes
+    python -m panda_control.main --stack        # stack all cubes
+    python -m panda_control.main --n-cubes 6    # spawn 6 cubes
+    python -m panda_control.main --seed 42      # reproducible scene
+"""
 from __future__ import annotations
 
 import argparse
 
 import numpy as np
 
+from panda_control.config import get as cfg
 from panda_control.task_runner import TaskRunner
 
 
 def parse_args() -> argparse.Namespace:
+    """Build and parse the command-line arguments."""
     parser = argparse.ArgumentParser(description="Panda Pick-and-Place demo")
     group = parser.add_mutually_exclusive_group()
     group.add_argument("--one", action="store_true", help="Pick and place one cube")
     group.add_argument("--all", action="store_true", help="Pick and place all cubes")
     group.add_argument("--stack", action="store_true", help="Stack all cubes")
-    parser.add_argument("--n-cubes", type=int, default=5, help="Number of cubes")
-    parser.add_argument("--seed", type=int, default=None, help="Random seed (omit for random)")
-    parser.add_argument("--delay", type=float, default=1 / 30, help="Sim delay per step (s)")
+    parser.add_argument("--n-cubes", type=int,
+                        default=cfg("task", "default_n_cubes"),
+                        help="Number of cubes")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Random seed (omit for random)")
+    parser.add_argument("--delay", type=float,
+                        default=cfg("cli", "default_delay"),
+                        help="Sim delay per step (s)")
     return parser.parse_args()
 
 
@@ -92,6 +109,12 @@ def main() -> None:
     print("Phase 3 – Pick-and-Place")
     print("=" * 60)
 
+    print("\nPress Enter to start the animation ...")
+    try:
+        input()
+    except (EOFError, KeyboardInterrupt):
+        pass
+
     if args.stack:
         print("\nStacking all cubes...")
         results = runner.stack_all()
@@ -129,6 +152,11 @@ def main() -> None:
             op = res.place_result.final_object_position
             print(f"  final pos: ({op[0]:.4f}, {op[1]:.4f}, {op[2]:.4f})")
 
+    print("\nClose the PyBullet window or press Enter to exit.")
+    try:
+        input()
+    except (EOFError, KeyboardInterrupt):
+        pass
     runner.close()
     print("Done.")
 
