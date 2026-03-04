@@ -11,7 +11,7 @@ scipy>=1.7.0
 numba>=0.53
 
 # Local panda-gym fork (install with: pip install -e ./panda-gym)
-# panda-gym
+panda-gym
 
 # Testing
 pytest>=7.0.0
