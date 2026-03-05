@@ -39,6 +39,8 @@ except ImportError:  # pragma: no cover
 def attractive_jit(position, goal, xi):
     r"""Attractive force: :math:`\xi \, (q_{\text{goal}} - q)`.
 
+    In plain terms: force = gain * (goal - current_position).
+
     Parameters
     ----------
     position, goal : ndarray, shape (3,)
@@ -61,6 +63,9 @@ def repulsive_jit(position, obstacles, n_obs, eta, d_thresh):
 
     Each obstacle row within *d_thresh* metres contributes a repulsive
     force proportional to :math:`\eta \, (1/d - 1/d_0) / d^2`.
+
+    In plain terms: force = gain * (1/distance - 1/threshold) / distance^2,
+    pointing away from the obstacle.
 
     Parameters
     ----------

@@ -43,6 +43,8 @@ def attractive_force(
     .. math::
 
         F_{att} = \xi \cdot (q_{goal} - q)
+
+    In plain terms: force = gain * (goal - current_position).
     """
     return attractive_jit(
         np.ascontiguousarray(position, dtype=np.float64),
@@ -66,6 +68,10 @@ def repulsive_force(
         F_{rep,i} = \eta \cdot (1/d - 1/d_0) / d^2 \cdot \hat{n}
 
     where *d* is the Euclidean distance and *d_0* = *d_thresh*.
+
+    In plain terms: for each obstacle closer than the threshold,
+    repulsive force = gain * (1/distance - 1/threshold) / distance^2,
+    directed away from the obstacle.
     """
     obs_2d = _pack_obstacles(obstacles)
     return repulsive_jit(
